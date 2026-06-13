@@ -1,31 +1,25 @@
 """
 Basketball Analytics POC v3
 ----------------------------
-Integra detección, tracking, y el motor de eventos de pelota.
-
-Eventos detectados:
-  POSSESSION  — jugador con la pelota
-  PASS        — pase entre jugadores
-  SHOT        — tiro al aro
-  BASKET      — canasta
-  LOOSE_BALL  — pelota suelta
-  DEAD_BALL   — pelota quieta
-
 Uso:
-    # Video sintético (sin modelo, ideal para testear la lógica)
-    python basketball_poc_v3.py --source test_basketball.mp4 --synthetic-mode
-
-    # Con YOLO real
     python basketball_poc_v3.py --source video.mp4
+    python basketball_poc_v3.py --source video.mp4 --output resultado.mp4
+    python basketball_poc_v3.py --source video.mp4 --weights yolo11x.pt
 
-    # Con calibración de cancha
-    python basketball_poc_v3.py --source video.mp4 --court-config court_config.json
+La cancha se detecta automáticamente en los primeros frames.
+Se muestra una preview 3 segundos — presioná ENTER para continuar.
+
+Controles durante el video:
+  Q  — salir
+  P  — pausar / continuar
+  S  — guardar screenshot
+  H  — toggle heatmap
+  M  — toggle mini-mapa
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -35,520 +29,415 @@ import numpy as np
 import supervision as sv
 
 from ball_tracker import BallTracker, RIM_LEFT, RIM_RIGHT
+from court_detector import CourtDetector
 from event_engine import EventEngine, EventType, GameEvent
 from stats_collector import StatsCollector
 
 # ---------------------------------------------------------------------------
-# Configuración de cancha por defecto
+# Dimensiones reales de cancha NBA (cm)
 # ---------------------------------------------------------------------------
-DEFAULT_SOURCE_POINTS = np.array([
-    [100,  620],
-    [1180, 620],
-    [1080, 100],
-    [200,  100],
-], dtype=np.float32)
+COURT_W = 2865
+COURT_H = 1524
 
-COURT_WIDTH_CM  = 2865
-COURT_HEIGHT_CM = 1524
-
-TEAM_A_COLOR = (230, 230, 230)
-TEAM_B_COLOR = (80,   80, 220)
-BALL_COLOR   = (0,   160, 255)
+# Colores
+TEAM_A  = (230, 230, 230)
+TEAM_B  = (80,   80, 220)
+BALL_C  = (0,   160, 255)
 EVENT_COLORS = {
     EventType.POSSESSION: (0, 255, 200),
-    EventType.PASS:       (0, 200, 255),
-    EventType.SHOT:       (0, 100, 255),
-    EventType.BASKET:     (0, 255,   0),
-    EventType.LOOSE_BALL: (0, 180, 255),
-    EventType.DEAD_BALL:  (120, 120, 120),
+    EventType.PASS:       (255, 200,  0),
+    EventType.SHOT:       (0,  100, 255),
+    EventType.BASKET:     (0,  255,   0),
+    EventType.LOOSE_BALL: (0,  200, 255),
+    EventType.DEAD_BALL:  (120,120, 120),
 }
+
 
 # ---------------------------------------------------------------------------
 # ViewTransformer
 # ---------------------------------------------------------------------------
 class ViewTransformer:
     def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
-        self.M = cv2.getPerspectiveTransform(
-            source.astype(np.float32),
-            target.astype(np.float32),
-        )
-        self.M_inv = cv2.getPerspectiveTransform(
-            target.astype(np.float32),
-            source.astype(np.float32),
-        )
+        self.M     = cv2.getPerspectiveTransform(source.astype(np.float32), target.astype(np.float32))
+        self.M_inv = cv2.getPerspectiveTransform(target.astype(np.float32), source.astype(np.float32))
 
-    def to_court(self, points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return points
-        pts = points.reshape(-1, 1, 2).astype(np.float32)
-        return cv2.perspectiveTransform(pts, self.M).reshape(-1, 2)
+    def to_court(self, pts: np.ndarray) -> np.ndarray:
+        if pts.size == 0:
+            return pts
+        return cv2.perspectiveTransform(pts.reshape(-1,1,2).astype(np.float32), self.M).reshape(-1,2)
 
-    def to_pixel(self, points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return points
-        pts = points.reshape(-1, 1, 2).astype(np.float32)
-        return cv2.perspectiveTransform(pts, self.M_inv).reshape(-1, 2)
+    def to_pixel(self, pts: np.ndarray) -> np.ndarray:
+        if pts.size == 0:
+            return pts
+        return cv2.perspectiveTransform(pts.reshape(-1,1,2).astype(np.float32), self.M_inv).reshape(-1,2)
 
 
 # ---------------------------------------------------------------------------
-# Asignación de equipos por color (sin CLIP para simplificar)
+# Asignación de equipos por brillo del jersey
 # ---------------------------------------------------------------------------
-def assign_team_by_brightness(frame: np.ndarray, box: np.ndarray) -> int:
+def assign_team(frame: np.ndarray, box: np.ndarray) -> int:
     x1, y1, x2, y2 = map(int, box)
     h = y2 - y1
-    # Recortar el tercio del torso
-    ty1, ty2 = y1 + h // 4, y1 + h * 3 // 4
-    crop = frame[max(0,ty1):ty2, max(0,x1):x2]
+    crop = frame[max(0, y1 + h//4) : max(0, y1 + h*3//4), max(0,x1):x2]
     if crop.size == 0:
         return 0
-    brightness = float(np.mean(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)))
-    return 0 if brightness > 110 else 1
+    return 0 if float(np.mean(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))) > 110 else 1
 
 
 # ---------------------------------------------------------------------------
-# Mini-mapa con eventos
+# Mini-mapa
 # ---------------------------------------------------------------------------
-class CourtMiniMap:
+class MiniMap:
     W, H = 420, 224
 
-    def __init__(self, transformer: ViewTransformer) -> None:
-        self.sx = self.W / COURT_WIDTH_CM
-        self.sy = self.H / COURT_HEIGHT_CM
-        self.transformer = transformer
-        self._base = self._draw_base()
+    def __init__(self) -> None:
+        self.sx = self.W / COURT_W
+        self.sy = self.H / COURT_H
+        self._base = self._make_base()
 
-    def _px(self, x: float, y: float) -> tuple[int, int]:
-        return int(np.clip(x * self.sx, 0, self.W - 1)), int(np.clip(y * self.sy, 0, self.H - 1))
+    def _p(self, x: float, y: float) -> tuple[int,int]:
+        return int(np.clip(x*self.sx, 0, self.W-1)), int(np.clip(y*self.sy, 0, self.H-1))
 
-    def _draw_base(self) -> np.ndarray:
-        img = np.full((self.H, self.W, 3), (45, 35, 25), dtype=np.uint8)
-        lc = (180, 180, 180)
-        cv2.rectangle(img, (0, 0), (self.W-1, self.H-1), lc, 1)
-        # pinturas
-        cv2.rectangle(img, self._px(0, 427), self._px(488, 1097), (40, 40, 70), -1)
-        cv2.rectangle(img, self._px(2377, 427), self._px(2865, 1097), (40, 40, 70), -1)
-        cv2.rectangle(img, self._px(0, 427), self._px(488, 1097), lc, 1)
-        cv2.rectangle(img, self._px(2377, 427), self._px(2865, 1097), lc, 1)
-        # línea central
-        cv2.line(img, self._px(COURT_WIDTH_CM/2, 0), self._px(COURT_WIDTH_CM/2, COURT_HEIGHT_CM), lc, 1)
-        # círculo central
-        cx, cy = self._px(COURT_WIDTH_CM/2, COURT_HEIGHT_CM/2)
-        cv2.circle(img, (cx, cy), int(183*self.sx), lc, 1)
-        # aros
+    def _make_base(self) -> np.ndarray:
+        img = np.full((self.H, self.W, 3), (45,35,25), np.uint8)
+        lc = (180,180,180)
+        cv2.rectangle(img, (0,0), (self.W-1,self.H-1), lc, 1)
+        cv2.rectangle(img, self._p(0,427),  self._p(488,1097),  (40,40,70), -1)
+        cv2.rectangle(img, self._p(2377,427), self._p(2865,1097), (40,40,70), -1)
+        cv2.rectangle(img, self._p(0,427),  self._p(488,1097),  lc, 1)
+        cv2.rectangle(img, self._p(2377,427), self._p(2865,1097), lc, 1)
+        cv2.line(img, self._p(COURT_W/2,0), self._p(COURT_W/2,COURT_H), lc, 1)
+        cx, cy = self._p(COURT_W/2, COURT_H/2)
+        cv2.circle(img, (cx,cy), int(183*self.sx), lc, 1)
         for rim in (RIM_LEFT, RIM_RIGHT):
-            cv2.circle(img, self._px(*rim), max(2, int(23*self.sx)), (0, 120, 255), 2)
+            cv2.circle(img, self._p(*rim), max(2,int(23*self.sx)), (0,120,255), 2)
         return img
 
     def render(
         self,
         tracker_ids:  np.ndarray,
         court_coords: np.ndarray,
-        team_cache:   dict[int, int],
-        ball_court:   np.ndarray | None,
-        recent_events: list[GameEvent],
+        teams:        dict[int,int],
+        ball:         np.ndarray | None,
+        events:       list[GameEvent],
     ) -> np.ndarray:
         canvas = self._base.copy()
-
-        # Eventos recientes sobre el mapa
-        for ev in recent_events[-3:]:
+        for ev in events[-3:]:
             if ev.ball_pos is not None:
-                epx, epy = self._px(*ev.ball_pos)
-                color = EVENT_COLORS.get(ev.type, (255, 255, 255))
-                cv2.circle(canvas, (epx, epy), 10, color, 1)
-                cv2.putText(canvas, ev.type.name[:4], (epx+3, epy-3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
-
-        # Jugadores
-        for tid, (cx, cy) in zip(tracker_ids, court_coords):
-            team = team_cache.get(int(tid), -1)
-            color = TEAM_A_COLOR if team == 0 else TEAM_B_COLOR
-            px, py = self._px(cx, cy)
-            cv2.circle(canvas, (px, py), 6, color, -1)
-            cv2.circle(canvas, (px, py), 6, (0, 0, 0), 1)
-            cv2.putText(canvas, str(tid), (px+5, py+4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
-
-        # Pelota
-        if ball_court is not None:
-            bx, by = self._px(*ball_court)
-            cv2.circle(canvas, (bx, by), 7, BALL_COLOR, -1)
-            cv2.circle(canvas, (bx, by), 7, (255, 255, 255), 1)
-
+                px, py = self._p(*ev.ball_pos)
+                c = EVENT_COLORS.get(ev.type, (255,255,255))
+                cv2.circle(canvas, (px,py), 10, c, 1)
+                cv2.putText(canvas, ev.type.name[:4], (px+3,py-3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, c, 1)
+        for tid, (cx,cy) in zip(tracker_ids, court_coords):
+            c = TEAM_A if teams.get(int(tid))==0 else TEAM_B
+            px, py = self._p(cx, cy)
+            cv2.circle(canvas, (px,py), 6, c, -1)
+            cv2.circle(canvas, (px,py), 6, (0,0,0), 1)
+            cv2.putText(canvas, str(tid), (px+5,py+4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, c, 1)
+        if ball is not None:
+            bx, by = self._p(*ball)
+            cv2.circle(canvas, (bx,by), 7, BALL_C, -1)
+            cv2.circle(canvas, (bx,by), 7, (255,255,255), 1)
         return canvas
 
 
 # ---------------------------------------------------------------------------
-# Overlay de eventos recientes en pantalla
+# Feed de eventos en pantalla
 # ---------------------------------------------------------------------------
 class EventFeed:
-    """Muestra los últimos N eventos en pantalla como un feed."""
+    def __init__(self, fps: float, max_n: int = 6, ttl_s: float = 4.0) -> None:
+        self.ttl = int(ttl_s * fps)
+        self.items: deque[tuple[GameEvent,int]] = deque(maxlen=max_n)
 
-    def __init__(self, max_events: int = 6, ttl_seconds: float = 4.0, fps: float = 30) -> None:
-        self.max = max_events
-        self.ttl_frames = int(ttl_seconds * fps)
-        self.items: deque[tuple[GameEvent, int]] = deque(maxlen=max_events)  # (event, frame_added)
+    def add(self, ev: GameEvent, frame: int) -> None:
+        self.items.append((ev, frame))
 
-    def add(self, event: GameEvent, current_frame: int) -> None:
-        self.items.append((event, current_frame))
-
-    def render(self, frame: np.ndarray, current_frame: int) -> np.ndarray:
-        # Filtrar eventos expirados
-        active = [(ev, f) for ev, f in self.items if current_frame - f < self.ttl_frames]
+    def render(self, img: np.ndarray, frame: int) -> np.ndarray:
+        active = [(ev,f) for ev,f in self.items if frame - f < self.ttl]
         if not active:
-            return frame
+            return img
 
-        x_start = frame.shape[1] - 340
-        y_start = 80
-        line_h  = 26
+        x0 = img.shape[1] - 345
+        y0 = 80
+        lh = 26
 
-        # Fondo
-        overlay = frame.copy()
-        cv2.rectangle(overlay,
-                      (x_start - 8, y_start - 20),
-                      (frame.shape[1] - 8, y_start + line_h * len(active) + 4),
-                      (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-
-        cv2.putText(frame, "EVENTOS", (x_start, y_start - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        ov = img.copy()
+        cv2.rectangle(ov, (x0-8, y0-22), (img.shape[1]-8, y0+lh*len(active)+4), (0,0,0), -1)
+        cv2.addWeighted(ov, 0.55, img, 0.45, 0, img)
+        cv2.putText(img, "EVENTOS", (x0, y0-7), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180,180,180), 1)
 
         for i, (ev, f) in enumerate(reversed(active)):
-            age_ratio = 1.0 - (current_frame - f) / self.ttl_frames
-            color = EVENT_COLORS.get(ev.type, (200, 200, 200))
-            alpha_color = tuple(int(c * age_ratio) for c in color)
-
-            team_s = ("A" if ev.team == 0 else "B") if ev.team in (0, 1) else ""
-            player_s = f"#{ev.player_id}" if ev.player_id is not None else ""
-
-            if ev.type == EventType.PASS and ev.receiver_id:
-                text = f"{ev.type.name}  {player_s} → #{ev.receiver_id} [{team_s}]"
-            elif ev.type == EventType.BASKET:
-                text = f"CANASTA!  {player_s} [{team_s}]  🏀"
+            ratio = 1.0 - (frame - f) / self.ttl
+            c = tuple(int(ch*ratio) for ch in EVENT_COLORS.get(ev.type,(200,200,200)))
+            ts = ("A" if ev.team==0 else "B") if ev.team in (0,1) else ""
+            ps = f"#{ev.player_id}" if ev.player_id is not None else ""
+            if ev.type == EventType.BASKET:
+                txt = f"CANASTA  {ps} [{ts}]"
+            elif ev.type == EventType.PASS and ev.receiver_id:
+                txt = f"PASE  {ps} → #{ev.receiver_id}"
             elif ev.type == EventType.SHOT:
-                text = f"TIRO  {player_s} [{team_s}]  {ev.speed_ms:.1f}m/s"
+                txt = f"TIRO  {ps} [{ts}]  {ev.speed_ms:.1f}m/s"
             else:
-                text = f"{ev.type.name}  {player_s} [{team_s}]"
+                txt = f"{ev.type.name}  {ps} [{ts}]"
+            cv2.putText(img, txt, (x0, y0+i*lh), cv2.FONT_HERSHEY_SIMPLEX, 0.47, c, 1)
 
-            cv2.putText(frame, text, (x_start, y_start + i * line_h),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, alpha_color, 1)
-
-        return frame
+        return img
 
 
 # ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
 def main(
-    source_video_path:  str,
-    target_video_path:  str | None = None,
-    court_config_path:  str | None = None,
-    model_weights:      str = "yolo11n.pt",
-    confidence:         float = 0.35,
-    iou:                float = 0.50,
-    synthetic_mode:     bool = False,
+    source: str,
+    output: str | None = None,
+    weights: str = "yolo11n.pt",
+    conf: float = 0.35,
+    iou:  float = 0.50,
+    show_heatmap: bool = True,
+    show_minimap: bool = True,
 ) -> None:
     print(f"\n{'='*60}")
-    print("  Basketball Analytics POC v3 — Motor de Eventos")
+    print("  Basketball Analytics POC v3")
+    print(f"{'='*60}")
+    print(f"  Video  : {source}")
+    print(f"  Modelo : {weights}")
     print(f"{'='*60}\n")
 
-    # --- Cancha ---
-    source_pts = DEFAULT_SOURCE_POINTS
-    if court_config_path and Path(court_config_path).exists():
-        cfg = json.load(open(court_config_path))
-        source_pts = np.array(cfg["source_points"], dtype=np.float32)
+    # ── 1. Detectar cancha automáticamente ───────────────────────────
+    print("Detectando cancha...")
+    detector = CourtDetector()
+    corners  = detector.detect_from_video(source, preview=True)
+    print(f"  Esquinas: {corners.astype(int).tolist()}\n")
 
-    target_pts = np.array([
-        [0,              COURT_HEIGHT_CM],
-        [COURT_WIDTH_CM, COURT_HEIGHT_CM],
-        [COURT_WIDTH_CM, 0],
-        [0,              0],
+    target = np.array([
+        [0,       COURT_H],
+        [COURT_W, COURT_H],
+        [COURT_W, 0],
+        [0,       0],
     ], dtype=np.float32)
+    transformer = ViewTransformer(corners, target)
 
-    transformer = ViewTransformer(source_pts, target_pts)
+    # ── 2. Cargar modelo ─────────────────────────────────────────────
+    try:
+        from ultralytics import YOLO
+        print(f"Cargando {weights} ...")
+        model = YOLO(weights)
+    except ImportError:
+        raise SystemExit("Instalá ultralytics:  pip install ultralytics")
 
-    # --- Video ---
-    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    # ── 3. Supervision / tracking ────────────────────────────────────
+    video_info = sv.VideoInfo.from_video_path(source)
     fps = video_info.fps
-    print(f"Video: {video_info.width}×{video_info.height} @ {fps:.1f}fps")
+    print(f"Video: {video_info.width}×{video_info.height} @ {fps:.1f} fps\n")
 
-    # --- Motor de eventos y estadísticas ---
+    byte_track = sv.ByteTrack(frame_rate=fps, track_activation_threshold=conf)
+    smoother   = sv.DetectionsSmoother()
+
+    thick = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
+    tscl  = sv.calculate_optimal_text_scale(video_info.resolution_wh)
+
+    trace_ann = sv.TraceAnnotator(thickness=max(1,thick-1),
+                                  trace_length=int(fps*3),
+                                  position=sv.Position.BOTTOM_CENTER)
+    label_ann = sv.LabelAnnotator(text_scale=tscl*0.8,
+                                  text_thickness=max(1,thick-1),
+                                  text_position=sv.Position.TOP_CENTER,
+                                  text_padding=3)
+    heat_ann  = sv.HeatMapAnnotator(position=sv.Position.BOTTOM_CENTER,
+                                    opacity=0.35, radius=50, kernel_size=31)
+
+    # ── 4. Módulos de análisis ───────────────────────────────────────
+    ball_tr = BallTracker(fps=fps)
     stats   = StatsCollector(fps=fps)
-    engine  = EventEngine(fps=fps, on_event=stats.record)
-    ball_tr = BallTracker(fps=fps, history_seconds=2.0)
-    mini_map= CourtMiniMap(transformer)
-    feed    = EventFeed(max_events=6, ttl_seconds=4.0, fps=fps)
+    engine  = EventEngine(fps=fps)
+    feed    = EventFeed(fps=fps)
+    minimap = MiniMap()
     recent_events: list[GameEvent] = []
 
     def on_event(ev: GameEvent) -> None:
+        stats.record(ev)
         feed.add(ev, ev.frame_idx)
         recent_events.append(ev)
         print(str(ev))
 
     engine.on_event = on_event
 
-    # --- Modelo (opcional en modo sintético) ---
-    if not synthetic_mode:
-        try:
-            from ultralytics import YOLO
-            model = YOLO(model_weights)
-            print(f"Modelo cargado: {model_weights}")
-        except ImportError:
-            print("ultralytics no encontrado — activando modo sintético")
-            synthetic_mode = True
+    # ── 5. Exportación ───────────────────────────────────────────────
+    stem     = Path(source).stem
+    csv_sink = sv.CSVSink(f"{stem}_tracking.csv")
+    sink_ctx = sv.VideoSink(output, video_info) if output else None
 
-    # --- Tracker y anotadores ---
-    byte_track = sv.ByteTrack(frame_rate=fps, track_activation_threshold=confidence)
-    smoother   = sv.DetectionsSmoother()
+    team_cache: dict[int,int] = {}
+    show_hm = show_heatmap
+    show_mm = show_minimap
+    paused  = False
+    frames  = sv.get_video_frames_generator(source)
 
-    thickness  = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
-    text_scale = sv.calculate_optimal_text_scale(video_info.resolution_wh)
+    print("Procesando... (Q=salir  P=pausa  S=screenshot  H=heatmap  M=mapa)\n")
 
-    trace_ann = sv.TraceAnnotator(thickness=max(1, thickness-1),
-                                  trace_length=int(fps*3),
-                                  position=sv.Position.BOTTOM_CENTER)
-    label_ann = sv.LabelAnnotator(text_scale=text_scale*0.8,
-                                  text_thickness=max(1, thickness-1),
-                                  text_position=sv.Position.TOP_CENTER,
-                                  text_padding=3)
+    with csv_sink:
+        for frame_idx, frame in enumerate(frames):
 
-    # --- Sink de salida ---
-    stem     = Path(source_video_path).stem
-    sink_ctx = sv.VideoSink(target_video_path, video_info) if target_video_path else None
+            # ── Pausa ──
+            if paused:
+                key = cv2.waitKey(50) & 0xFF
+                if key == ord("p"): paused = False
+                elif key == ord("q"): break
+                continue
 
-    team_cache: dict[int, int] = {}
-    frame_generator = sv.get_video_frames_generator(source_video_path)
+            # ── Detección YOLO ──
+            results    = model(frame, conf=conf, iou=iou, verbose=False)[0]
+            all_dets   = sv.Detections.from_ultralytics(results)
+            p_dets     = all_dets[all_dets.class_id == 0]   # personas
+            b_dets     = all_dets[all_dets.class_id == 32]  # pelota
 
-    print("\nProcesando... (Q=salir, P=pausa, S=screenshot)\n")
-    paused = False
+            # ── Tracking jugadores ──
+            p_dets = smoother.update_with_detections(p_dets)
+            p_dets = byte_track.update_with_detections(p_dets)
 
-    for frame_idx, frame in enumerate(frame_generator):
-        if paused:
-            key = cv2.waitKey(50) & 0xFF
-            if key == ord("p"): paused = False
-            elif key == ord("q"): break
-            continue
+            if p_dets.tracker_id is not None:
+                for tid, box in zip(p_dets.tracker_id, p_dets.xyxy):
+                    if tid not in team_cache:
+                        team_cache[tid] = assign_team(frame, box)
 
-        # ---- Detección ----
-        if synthetic_mode:
-            player_dets, ball_pixel, ball_conf = _synthetic_detections(frame_idx, fps)
-        else:
-            results     = model(frame, conf=confidence, iou=iou, verbose=False)[0]
-            all_dets    = sv.Detections.from_ultralytics(results)
-            player_dets = all_dets[all_dets.class_id == 0]
-            ball_dets   = all_dets[all_dets.class_id == 32]
-            ball_pixel  = None
-            ball_conf   = 0.0
-            if len(ball_dets) > 0:
-                anchors   = ball_dets.get_anchors_coordinates(sv.Position.CENTER)
-                best      = int(np.argmax(ball_dets.confidence))
-                ball_pixel = anchors[best]
-                ball_conf  = float(ball_dets.confidence[best])
+            # ── Coordenadas de cancha ──
+            anchors      = p_dets.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+            court_coords = transformer.to_court(anchors) if len(anchors) > 0 else np.zeros((0,2))
 
-        # ---- Tracking de jugadores ----
-        player_dets = smoother.update_with_detections(player_dets)
-        player_dets = byte_track.update_with_detections(player_dets)
+            ball_pixel = ball_court = None
+            if len(b_dets) > 0:
+                best       = int(np.argmax(b_dets.confidence))
+                ball_pixel = b_dets.get_anchors_coordinates(sv.Position.CENTER)[best]
+                ball_court = transformer.to_court(ball_pixel.reshape(1,2))[0]
 
-        # Asignación de equipos por brillo
-        if player_dets.tracker_id is not None:
-            for tid, box in zip(player_dets.tracker_id, player_dets.xyxy):
-                if tid not in team_cache:
-                    team_cache[tid] = assign_team_by_brightness(frame, box)
-
-        # ---- Coordenadas de cancha ----
-        player_anchors = player_dets.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-        court_coords   = transformer.to_court(player_anchors) if len(player_anchors) > 0 else np.zeros((0, 2))
-
-        # Pelota en coordenadas de cancha
-        ball_court = None
-        if ball_pixel is not None:
-            ball_court = transformer.to_court(ball_pixel.reshape(1, 2))[0]
-
-        # ---- BallTracker + EventEngine ----
-        ball_tr.update(frame_idx, ball_pixel, ball_court, ball_conf)
-        ball_state = ball_tr.get_state(
-            player_ids    = player_dets.tracker_id if player_dets.tracker_id is not None else np.array([]),
-            player_court_coords = court_coords,
-        )
-        events = engine.update(frame_idx, ball_state, team_cache)
-        stats.tick(frame_idx)
-
-        # ---- Render ----
-        annotated = frame.copy()
-
-        # Traces de jugadores
-        annotated = trace_ann.annotate(annotated, player_dets)
-
-        # Boxes de jugadores con color por equipo
-        if player_dets.tracker_id is not None:
-            for box, tid in zip(player_dets.xyxy, player_dets.tracker_id):
-                color = TEAM_A_COLOR if team_cache.get(int(tid)) == 0 else TEAM_B_COLOR
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
-
-        # Labels de jugadores
-        if player_dets.tracker_id is not None:
-            labels = []
-            for tid in player_dets.tracker_id:
-                t = team_cache.get(int(tid), -1)
-                ts = "A" if t == 0 else ("B" if t == 1 else "?")
-                is_possessor = engine.possessor_id == int(tid)
-                marker = " ●" if is_possessor else ""
-                labels.append(f"#{tid}[{ts}]{marker}")
-            annotated = label_ann.annotate(annotated, player_dets, labels)
-
-        # Pelota
-        if ball_pixel is not None:
-            bx, by = int(ball_pixel[0]), int(ball_pixel[1])
-            cv2.circle(annotated, (bx, by), 14, BALL_COLOR, -1)
-            cv2.circle(annotated, (bx, by), 14, (255,255,255), 2)
-            # Mostrar velocidad sobre la pelota
-            if ball_state.speed_ms > 0.5:
-                cv2.putText(annotated, f"{ball_state.speed_ms:.1f}m/s",
-                            (bx + 16, by - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, BALL_COLOR, 2)
-
-        # Traza de trayectoria de la pelota
-        ball_pix_hist = ball_tr.pixel_positions()
-        if len(ball_pix_hist) >= 2:
-            for i in range(1, len(ball_pix_hist)):
-                alpha = i / len(ball_pix_hist)
-                color = tuple(int(c * alpha) for c in BALL_COLOR)
-                pt1 = tuple(ball_pix_hist[i-1].astype(int))
-                pt2 = tuple(ball_pix_hist[i].astype(int))
-                cv2.line(annotated, pt1, pt2, color, 2)
-
-        # Resaltar poseedor
-        if engine.possessor_id is not None and player_dets.tracker_id is not None:
-            mask = player_dets.tracker_id == engine.possessor_id
-            if mask.any():
-                box = player_dets.xyxy[mask][0]
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(annotated, (x1-3, y1-3), (x2+3, y2+3), (0, 255, 200), 2)
-
-        # Feed de eventos
-        annotated = feed.render(annotated, frame_idx)
-
-        # Mini-mapa
-        if len(court_coords) > 0 and player_dets.tracker_id is not None:
-            mm = mini_map.render(
-                player_dets.tracker_id, court_coords, team_cache,
-                ball_court, recent_events[-5:]
+            # ── Motor de eventos ──
+            ball_tr.update(frame_idx, ball_pixel, ball_court)
+            ball_state = ball_tr.get_state(
+                player_ids=p_dets.tracker_id if p_dets.tracker_id is not None else np.array([]),
+                player_court_coords=court_coords,
             )
-            mh, mw = mm.shape[:2]
-            ox, oy = 10, annotated.shape[0] - mh - 10
-            cv2.rectangle(annotated, (ox-2, oy-2), (ox+mw+2, oy+mh+2), (180,180,180), 1)
-            annotated[oy:oy+mh, ox:ox+mw] = mm
+            engine.update(frame_idx, ball_state, team_cache)
+            stats.tick(frame_idx)
 
-        # HUD superior
-        _draw_hud(annotated, frame_idx, fps, engine, stats, ball_state)
+            # ── Exportar CSV ──
+            csv_sink.append(p_dets, custom_data={"frame": frame_idx})
 
-        if sink_ctx:
-            sink_ctx.write_frame(annotated)
+            # ── Render ──
+            vis = frame.copy()
 
-        cv2.imshow("Basketball Analytics v3", annotated)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("p"):
-            paused = True
-        elif key == ord("s"):
-            path = f"screenshot_{frame_idx:04d}.jpg"
-            cv2.imwrite(path, annotated)
-            print(f"Screenshot: {path}")
+            if show_hm:
+                vis = heat_ann.annotate(vis, p_dets)
+
+            vis = trace_ann.annotate(vis, p_dets)
+
+            # Boxes con color de equipo
+            if p_dets.tracker_id is not None:
+                for box, tid in zip(p_dets.xyxy, p_dets.tracker_id):
+                    c = TEAM_A if team_cache.get(int(tid))==0 else TEAM_B
+                    x1,y1,x2,y2 = map(int,box)
+                    cv2.rectangle(vis,(x1,y1),(x2,y2),c,thick)
+                    # Resaltar poseedor
+                    if engine.possessor_id == int(tid):
+                        cv2.rectangle(vis,(x1-3,y1-3),(x2+3,y2+3),(0,255,180),2)
+
+                labels = []
+                for tid in p_dets.tracker_id:
+                    t  = team_cache.get(int(tid),-1)
+                    ts = "A" if t==0 else ("B" if t==1 else "?")
+                    mk = " ●" if engine.possessor_id==int(tid) else ""
+                    labels.append(f"#{tid}[{ts}]{mk}")
+                vis = label_ann.annotate(vis, p_dets, labels)
+
+            # Pelota + trayectoria
+            hist = ball_tr.pixel_positions()
+            if len(hist) >= 2:
+                for i in range(1, len(hist)):
+                    a = i / len(hist)
+                    c = tuple(int(ch*a) for ch in BALL_C)
+                    cv2.line(vis, tuple(hist[i-1].astype(int)), tuple(hist[i].astype(int)), c, 2)
+
+            if ball_pixel is not None:
+                bx, by = int(ball_pixel[0]), int(ball_pixel[1])
+                cv2.circle(vis,(bx,by),14,BALL_C,-1)
+                cv2.circle(vis,(bx,by),14,(255,255,255),2)
+                if ball_state.speed_ms > 0.5:
+                    cv2.putText(vis, f"{ball_state.speed_ms:.1f}m/s",
+                                (bx+16,by-6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, BALL_C, 2)
+
+            # Mini-mapa
+            if show_mm and p_dets.tracker_id is not None and len(court_coords)>0:
+                mm = minimap.render(
+                    p_dets.tracker_id, court_coords, team_cache,
+                    ball_court, recent_events[-5:]
+                )
+                mh, mw = mm.shape[:2]
+                oy = vis.shape[0]-mh-10
+                cv2.rectangle(vis,(8,oy-2),(10+mw+2,oy+mh+2),(180,180,180),1)
+                vis[oy:oy+mh, 10:10+mw] = mm
+
+            # Feed de eventos
+            vis = feed.render(vis, frame_idx)
+
+            # HUD
+            phase_s = engine.phase.name
+            speed_s = f"Pelota: {ball_state.speed_ms:.1f}m/s" if ball_state.detected else "Pelota: no detectada"
+            poss_s  = ""
+            if engine.possessor_id is not None:
+                t = ("Eq.A" if engine.possessor_team==0 else "Eq.B") if engine.possessor_team in (0,1) else ""
+                poss_s = f"POSESION: #{engine.possessor_id} {t}"
+
+            ov = vis.copy()
+            cv2.rectangle(ov,(0,0),(vis.shape[1],64),(0,0,0),-1)
+            cv2.addWeighted(ov, 0.5, vis, 0.5, 0, vis)
+            cv2.putText(vis, f"Frame {frame_idx:04d}  |  {phase_s}  |  {speed_s}",
+                        (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.52,(220,220,220),1)
+            if poss_s:
+                cv2.putText(vis, poss_s, (10,42), cv2.FONT_HERSHEY_SIMPLEX, 0.52,(0,255,180),1)
+
+            if sink_ctx:
+                sink_ctx.write_frame(vis)
+
+            cv2.imshow("Basketball Analytics v3", vis)
+            key = cv2.waitKey(1) & 0xFF
+            if   key == ord("q"): break
+            elif key == ord("p"): paused = True
+            elif key == ord("h"): show_hm = not show_hm
+            elif key == ord("m"): show_mm = not show_mm
+            elif key == ord("s"):
+                p = f"screenshot_{frame_idx:04d}.jpg"
+                cv2.imwrite(p, vis)
+                print(f"Screenshot: {p}")
 
     if sink_ctx:
         sink_ctx.__exit__(None, None, None)
     cv2.destroyAllWindows()
 
-    # --- Resumen final ---
     stats.print_summary()
     stats.export_json(f"{stem}_stats.json")
 
 
 # ---------------------------------------------------------------------------
-# HUD
-# ---------------------------------------------------------------------------
-def _draw_hud(frame, frame_idx, fps, engine, stats, ball_state):
-    possession_s = ""
-    if engine.possessor_id is not None:
-        pid  = engine.possessor_id
-        team = ("Eq.A" if engine.possessor_team == 0 else "Eq.B") if engine.possessor_team in (0,1) else ""
-        possession_s = f"POSESION: #{pid} {team}"
-
-    phase_s = engine.phase.name
-    speed_s = f"Pelota: {ball_state.speed_ms:.1f}m/s" if ball_state.detected else "Pelota: no detectada"
-
-    hud = [
-        f"Frame {frame_idx:04d}  |  {phase_s}  |  {speed_s}",
-        possession_s,
-    ]
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 18 + 22 * len(hud)), (0,0,0), -1)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-    for i, line in enumerate(hud):
-        cv2.putText(frame, line, (10, 16 + 22*i),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220,220,220), 1)
-
-
-# ---------------------------------------------------------------------------
-# Detecciones sintéticas para testear sin modelo
-# ---------------------------------------------------------------------------
-def _synthetic_detections(frame_idx: int, fps: float):
-    """
-    Simula 10 jugadores y una pelota con movimiento básico.
-    Devuelve sv.Detections con xyxy, class_id, confidence.
-    """
-    import math
-
-    t = frame_idx / fps
-
-    # 10 jugadores estáticos con pequeño movimiento
-    players_pos = []
-    for i in range(10):
-        angle = (i / 10) * 2 * math.pi + t * 0.3
-        rx = 400 + i * 50
-        ry = 300 + int(math.sin(angle) * 80)
-        # ancho/alto del bounding box
-        w, h = 40, 80
-        players_pos.append([rx - w//2, ry - h//2, rx + w//2, ry + h//2])
-
-    # Pelota: trayectoria simple de izquierda a derecha y rebote
-    bx = 200 + int((frame_idx % 300) * 3.0)
-    by = 360 + int(abs(math.sin(frame_idx * 0.25)) * -60)
-    ball_pixel = np.array([float(bx), float(by)])
-
-    xyxy = np.array(players_pos, dtype=np.float32)
-    class_ids = np.zeros(len(players_pos), dtype=int)
-    confs = np.ones(len(players_pos), dtype=float) * 0.9
-
-    dets = sv.Detections(xyxy=xyxy, class_id=class_ids, confidence=confs)
-    return dets, ball_pixel, 0.9
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Basketball Analytics v3 — Motor de eventos de pelota"
+    ap = argparse.ArgumentParser(
+        description="Basketball Analytics v3 — detección automática de cancha + motor de eventos"
     )
-    parser.add_argument("--source",        required=True,       help="Video de entrada")
-    parser.add_argument("--output",  "-o", default=None,        help="Video de salida")
-    parser.add_argument("--court-config",  default=None,        help="court_config.json")
-    parser.add_argument("--weights",       default="yolo11n.pt",help="Pesos YOLO")
-    parser.add_argument("--conf",  type=float, default=0.35)
-    parser.add_argument("--iou",   type=float, default=0.50)
-    parser.add_argument("--synthetic-mode", action="store_true",
-                        help="Usar detecciones sintéticas (no requiere YOLO)")
-    args = parser.parse_args()
+    ap.add_argument("--source",   required=True,        help="Video de entrada (.mp4)")
+    ap.add_argument("--output",   default=None,         help="Video de salida anotado (opcional)")
+    ap.add_argument("--weights",  default="yolo11n.pt", help="Pesos YOLO (default: yolo11n.pt)")
+    ap.add_argument("--conf",     type=float, default=0.35)
+    ap.add_argument("--iou",      type=float, default=0.50)
+    ap.add_argument("--no-heatmap", action="store_true")
+    ap.add_argument("--no-minimap", action="store_true")
+    args = ap.parse_args()
 
     main(
-        source_video_path = args.source,
-        target_video_path = args.output,
-        court_config_path = args.court_config,
-        model_weights     = args.weights,
-        confidence        = args.conf,
-        iou               = args.iou,
-        synthetic_mode    = args.synthetic_mode,
+        source       = args.source,
+        output       = args.output,
+        weights      = args.weights,
+        conf         = args.conf,
+        iou          = args.iou,
+        show_heatmap = not args.no_heatmap,
+        show_minimap = not args.no_minimap,
     )
