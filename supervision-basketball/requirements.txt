@@ -1,0 +1,17 @@
+# Core
+supervision>=0.25.0
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# CLIP para asignación de equipos (zero-shot)
+open-clip-torch>=2.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+Pillow>=10.0.0
+
+# Descarga de video de prueba
+yt-dlp>=2024.1.0
+
+# Extras útiles
+scipy>=1.11.0
