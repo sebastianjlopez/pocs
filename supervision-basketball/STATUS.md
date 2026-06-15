@@ -118,10 +118,19 @@ YOLO11n (y YOLO11s en pruebas) no detecta la pelota durante el arco del tiro —
 cuando más importa para detectar canastas. La pelota es pequeña, rápida y
 a veces motion-blurred.
 
-**Opciones:**
-- `yolo11m` o `yolo11l` — mejor recall pero más lento en CPU
-- Kalman filter dedicado para predecir trayectoria entre detecciones
-- Correr en GPU (Google Colab, RunPod) donde incluso `yolo11m` corre en tiempo real
+**En curso → fine-tuning en GPU de Colab.** Ver [`COLAB_TRAINING.md`](./COLAB_TRAINING.md)
+y el notebook [`train_basketball_yolo.ipynb`](./train_basketball_yolo.ipynb): entrena
+`yolo11x` en un dataset de básquet de Roboflow (jugadores + pelota + aro) en GPU de
+Colab. `basketball_poc_v3.py` ahora acepta `--player-class` y `--ball-class` para usar
+el esquema de clases del modelo fine-tuneado (los defaults siguen siendo COCO 0/32).
+
+El MCP `colab-mcp` se evaluó para manejar Colab desde el agente, pero **requiere correr
+Claude Code localmente** (necesita el navegador del usuario), así que no funciona desde
+la sesión web remota. La config quedó versionada en `.mcp.json` para uso local.
+
+Otras opciones complementarias:
+- Kalman filter dedicado para predecir trayectoria de la pelota entre detecciones
+- Entrenar con `imgsz=1280` (A100) para mejor recall del objeto chico
 
 ### Problema secundario: TeamAssigner no converge en clips cortos
 `MIN_PLAYERS = 6` no se alcanza cuando ByteTrack pierde tracks frecuentemente.

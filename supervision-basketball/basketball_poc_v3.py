@@ -275,12 +275,15 @@ def main(
     headless: bool = False,
     max_frames: int | None = None,
     court_corners: str | None = None,
+    player_class: int = 0,
+    ball_class: int = 32,
 ) -> None:
     print(f"\n{'='*60}")
     print("  Basketball Analytics POC v3")
     print(f"{'='*60}")
     print(f"  Video  : {source}")
     print(f"  Modelo : {weights}")
+    print(f"  Clases : jugador={player_class}  pelota={ball_class}")
     print(f"{'='*60}\n")
 
     # ── 1. Detectar cancha ───────────────────────────────────────────
@@ -382,9 +385,9 @@ def main(
             # Fix 1: correr con ball_conf (más bajo) para mejorar recall de pelota
             results  = model(frame, conf=min(conf, ball_conf), iou=iou, verbose=False)[0]
             all_dets = sv.Detections.from_ultralytics(results)
-            p_dets   = all_dets[(all_dets.class_id == 0) &
-                                 (all_dets.confidence >= conf)]    # personas: conf normal
-            b_dets   = all_dets[(all_dets.class_id == 32) &
+            p_dets   = all_dets[(all_dets.class_id == player_class) &
+                                 (all_dets.confidence >= conf)]    # jugadores: conf normal
+            b_dets   = all_dets[(all_dets.class_id == ball_class) &
                                  (all_dets.confidence >= ball_conf)]  # pelota: conf baja
 
             # Filtro de tamaño/forma: pelota de básquet debe ser ~cuadrada y 6–80px de alto
@@ -548,6 +551,12 @@ if __name__ == "__main__":
     ap.add_argument("--court-corners", default=None,
                     help="Esquinas de la cancha (override manual): 'x1,y1;x2,y2;x3,y3;x4,y4' "
                          "en orden INF-IZQ;INF-DER;SUP-DER;SUP-IZQ")
+    ap.add_argument("--player-class", type=int, default=0,
+                    help="class_id de 'jugador' en el modelo (COCO person=0; "
+                         "modelo fine-tuneado de básquet suele ser otro, ej. 1)")
+    ap.add_argument("--ball-class",   type=int, default=32,
+                    help="class_id de 'pelota' en el modelo (COCO sports ball=32; "
+                         "modelo fine-tuneado de básquet suele ser otro, ej. 0)")
     args = ap.parse_args()
 
     main(
@@ -562,4 +571,6 @@ if __name__ == "__main__":
         headless       = args.headless,
         max_frames     = args.max_frames,
         court_corners  = args.court_corners,
+        player_class   = args.player_class,
+        ball_class     = args.ball_class,
     )
