@@ -136,23 +136,43 @@ class BallTracker:
         """Devuelve el historial de posiciones en píxeles (N×2)."""
         return np.array([s.pixel_xy for s in self.history])
 
+    # Velocidad máxima física de una pelota de básquet (~35 m/s = tiro de toda cancha)
+    MAX_SPEED_MS = 35.0
+
     # ------------------------------------------------------------------
     def _calc_speed(self) -> tuple[float, np.ndarray]:
-        """Velocidad promedio sobre los últimos ~0.3s."""
+        """
+        Velocidad promedio sobre los últimos ~0.3s.
+        Solo usa muestras realmente detectadas (excluye interpolaciones).
+        Si el gap entre las dos últimas detecciones reales es mayor a 1s,
+        devuelve 0 para evitar velocidades ficticias por saltos de detección.
+        """
         window = min(len(self.history), max(2, int(self.fps * 0.3)))
         if window < 2:
             return 0.0, np.zeros(2)
 
         samples = list(self.history)[-window:]
-        deltas  = []
-        for i in range(1, len(samples)):
-            dt = max(1, samples[i].frame_idx - samples[i-1].frame_idx)
-            delta_cm = (samples[i].court_xy - samples[i-1].court_xy) / dt
+
+        # Filtrar solo muestras con detección real
+        real = [s for s in samples if s.detected]
+        if len(real) < 2:
+            return 0.0, np.zeros(2)
+
+        # Si el gap entre las dos detecciones reales más cercanas supera 1s → resetear
+        gap_frames = real[-1].frame_idx - real[-2].frame_idx
+        if gap_frames > self.fps:          # > 1 segundo de gap
+            return 0.0, np.zeros(2)
+
+        deltas = []
+        for i in range(1, len(real)):
+            dt = max(1, real[i].frame_idx - real[i-1].frame_idx)
+            delta_cm = (real[i].court_xy - real[i-1].court_xy) / dt
             deltas.append(delta_cm)
 
         avg_delta = np.mean(deltas, axis=0)  # cm/frame
         speed_cm_per_s = float(np.linalg.norm(avg_delta)) * self.fps
-        return speed_cm_per_s / 100.0, avg_delta  # m/s, cm/frame
+        speed_ms = min(speed_cm_per_s / 100.0, self.MAX_SPEED_MS)
+        return speed_ms, avg_delta  # m/s, cm/frame
 
     def _detect_bounce(self) -> bool:
         """

@@ -29,6 +29,7 @@ import numpy as np
 import supervision as sv
 
 from ball_tracker import BallTracker, RIM_LEFT, RIM_RIGHT
+from video_reader import get_video_info, frames_generator as pyav_frames
 from court_detector import CourtDetector
 from event_engine import EventEngine, EventType, GameEvent
 from stats_collector import StatsCollector
@@ -73,15 +74,77 @@ class ViewTransformer:
 
 
 # ---------------------------------------------------------------------------
-# Asignación de equipos por brillo del jersey
+# Asignación de equipos por brillo del jersey — k-means adaptativo
 # ---------------------------------------------------------------------------
-def assign_team(frame: np.ndarray, box: np.ndarray) -> int:
+def _jersey_brightness(frame: np.ndarray, box: np.ndarray) -> float:
     x1, y1, x2, y2 = map(int, box)
     h = y2 - y1
-    crop = frame[max(0, y1 + h//4) : max(0, y1 + h*3//4), max(0,x1):x2]
+    crop = frame[max(0, y1 + h//4) : max(0, y1 + h*3//4), max(0, x1):x2]
     if crop.size == 0:
-        return 0
-    return 0 if float(np.mean(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))) > 110 else 1
+        return 128.0
+    return float(np.mean(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)))
+
+
+class TeamAssigner:
+    """
+    Asigna equipos usando k-means adaptativo sobre el brillo del jersey.
+    Usa threshold fijo hasta tener suficientes jugadores; luego re-ajusta
+    los centros con k-means cada vez que aparece un jugador nuevo.
+    """
+
+    MIN_PLAYERS = 6        # mínimo de jugadores para activar k-means
+    REFIT_EVERY = 60       # re-ajustar centros cada N jugadores nuevos
+
+    def __init__(self) -> None:
+        self._brightness: dict[int, float] = {}   # tracker_id → brillo
+        self._teams:      dict[int, int]   = {}   # tracker_id → equipo (0 o 1)
+        self._centers:    tuple[float, float] | None = None   # (dark, bright)
+        self._new_since_refit = 0
+
+    # ------------------------------------------------------------------
+    def update(self, frame: np.ndarray, tracker_ids: np.ndarray,
+               boxes: np.ndarray) -> None:
+        """Registrar jugadores nuevos y re-ajustar k-means si corresponde."""
+        new_player = False
+        for tid, box in zip(tracker_ids, boxes):
+            if int(tid) not in self._brightness:
+                self._brightness[int(tid)] = _jersey_brightness(frame, box)
+                new_player = True
+                self._new_since_refit += 1
+
+        if new_player and len(self._brightness) >= self.MIN_PLAYERS:
+            if self._new_since_refit >= 1:
+                self._refit()
+                self._new_since_refit = 0
+
+    def get(self, tracker_id: int) -> int:
+        """Devuelve el equipo asignado (0 o 1). Si aún no clasificado, usa fallback."""
+        if tracker_id in self._teams:
+            return self._teams[tracker_id]
+        # Fallback hasta tener k-means: brillo > 110 → equipo 0
+        b = self._brightness.get(tracker_id, 128.0)
+        return 0 if b > 110 else 1
+
+    # ------------------------------------------------------------------
+    def _refit(self) -> None:
+        """K-means manual con k=2 sobre todos los brillos conocidos."""
+        values = np.array(list(self._brightness.values()), dtype=float)
+        # Inicializar centros con percentiles 25 y 75 para robustez
+        c0 = float(np.percentile(values, 25))
+        c1 = float(np.percentile(values, 75))
+        if abs(c1 - c0) < 5:          # jerseys indistinguibles → no re-ajustar
+            return
+        for _ in range(20):
+            labels = (np.abs(values - c1) < np.abs(values - c0)).astype(int)
+            new_c0 = float(values[labels == 0].mean()) if (labels == 0).any() else c0
+            new_c1 = float(values[labels == 1].mean()) if (labels == 1).any() else c1
+            if abs(new_c0 - c0) < 0.1 and abs(new_c1 - c1) < 0.1:
+                break
+            c0, c1 = new_c0, new_c1
+        self._centers = (c0, c1)   # (dark_center, bright_center)
+        # Re-asignar todos los jugadores conocidos
+        for tid, b in self._brightness.items():
+            self._teams[tid] = 0 if abs(b - c1) < abs(b - c0) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,14 +252,29 @@ class EventFeed:
 # ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
+def _parse_corners(s: str) -> np.ndarray:
+    """Parsea '0,684;1280,684;1280,36;0,36' → array (4,2)."""
+    pts = []
+    for part in s.split(";"):
+        x, y = part.strip().split(",")
+        pts.append([float(x), float(y)])
+    if len(pts) != 4:
+        raise ValueError(f"Se esperan 4 esquinas separadas por ';', se recibieron {len(pts)}")
+    return np.array(pts, dtype=np.float32)
+
+
 def main(
     source: str,
     output: str | None = None,
     weights: str = "yolo11n.pt",
     conf: float = 0.35,
+    ball_conf: float = 0.15,
     iou:  float = 0.50,
     show_heatmap: bool = True,
     show_minimap: bool = True,
+    headless: bool = False,
+    max_frames: int | None = None,
+    court_corners: str | None = None,
 ) -> None:
     print(f"\n{'='*60}")
     print("  Basketball Analytics POC v3")
@@ -205,11 +283,15 @@ def main(
     print(f"  Modelo : {weights}")
     print(f"{'='*60}\n")
 
-    # ── 1. Detectar cancha automáticamente ───────────────────────────
-    print("Detectando cancha...")
-    detector = CourtDetector()
-    corners  = detector.detect_from_video(source, preview=True)
-    print(f"  Esquinas: {corners.astype(int).tolist()}\n")
+    # ── 1. Detectar cancha ───────────────────────────────────────────
+    if court_corners:
+        corners = _parse_corners(court_corners)
+        print(f"Cancha: esquinas forzadas por CLI\n  {corners.astype(int).tolist()}\n")
+    else:
+        print("Detectando cancha...")
+        detector = CourtDetector()
+        corners  = detector.detect_from_video(source, preview=not headless)
+        print(f"  Esquinas: {corners.astype(int).tolist()}\n")
 
     target = np.array([
         [0,       COURT_H],
@@ -228,11 +310,17 @@ def main(
         raise SystemExit("Instalá ultralytics:  pip install ultralytics")
 
     # ── 3. Supervision / tracking ────────────────────────────────────
-    video_info = sv.VideoInfo.from_video_path(source)
+    video_info = get_video_info(source)   # PyAV — soporta AV1, H.264, H.265, VP9…
     fps = video_info.fps
     print(f"Video: {video_info.width}×{video_info.height} @ {fps:.1f} fps\n")
 
-    byte_track = sv.ByteTrack(frame_rate=fps, track_activation_threshold=conf)
+    # Fix 5: track_buffer más largo + mínimo 3 frames consecutivos para confirmar track
+    byte_track = sv.ByteTrack(
+        frame_rate=fps,
+        track_activation_threshold=conf,
+        lost_track_buffer=int(fps * 3),        # 3s antes de dar track por perdido
+        minimum_consecutive_frames=3,           # evitar tracks efímeros
+    )
     smoother   = sv.DetectionsSmoother()
 
     thick = sv.calculate_optimal_line_thickness(video_info.resolution_wh)
@@ -269,11 +357,14 @@ def main(
     csv_sink = sv.CSVSink(f"{stem}_tracking.csv")
     sink_ctx = sv.VideoSink(output, video_info) if output else None
 
+    team_assigner = TeamAssigner()
     team_cache: dict[int,int] = {}
     show_hm = show_heatmap
     show_mm = show_minimap
     paused  = False
-    frames  = sv.get_video_frames_generator(source)
+    frames  = pyav_frames(source, end=max_frames)   # PyAV — soporta AV1
+    if max_frames:
+        print(f"  Límite: {max_frames} frames ({max_frames/fps:.0f}s de video)\n")
 
     print("Procesando... (Q=salir  P=pausa  S=screenshot  H=heatmap  M=mapa)\n")
 
@@ -288,19 +379,33 @@ def main(
                 continue
 
             # ── Detección YOLO ──
-            results    = model(frame, conf=conf, iou=iou, verbose=False)[0]
-            all_dets   = sv.Detections.from_ultralytics(results)
-            p_dets     = all_dets[all_dets.class_id == 0]   # personas
-            b_dets     = all_dets[all_dets.class_id == 32]  # pelota
+            # Fix 1: correr con ball_conf (más bajo) para mejorar recall de pelota
+            results  = model(frame, conf=min(conf, ball_conf), iou=iou, verbose=False)[0]
+            all_dets = sv.Detections.from_ultralytics(results)
+            p_dets   = all_dets[(all_dets.class_id == 0) &
+                                 (all_dets.confidence >= conf)]    # personas: conf normal
+            b_dets   = all_dets[(all_dets.class_id == 32) &
+                                 (all_dets.confidence >= ball_conf)]  # pelota: conf baja
+
+            # Filtro de tamaño/forma: pelota de básquet debe ser ~cuadrada y 6–80px de alto
+            if len(b_dets) > 0:
+                xyxy    = b_dets.xyxy
+                heights = xyxy[:, 3] - xyxy[:, 1]
+                widths  = xyxy[:, 2] - xyxy[:, 0]
+                aspect  = np.where(heights > 0, widths / heights, 0.0)
+                valid   = (heights >= 6) & (heights <= 80) & (aspect >= 0.5) & (aspect <= 2.0)
+                b_dets  = b_dets[valid]
 
             # ── Tracking jugadores ──
-            p_dets = smoother.update_with_detections(p_dets)
+            # Fix 4: ByteTrack PRIMERO (asigna tracker_id), smoother DESPUÉS
             p_dets = byte_track.update_with_detections(p_dets)
+            p_dets = smoother.update_with_detections(p_dets)
 
+            # Fix 3: k-means adaptativo para asignación de equipos
             if p_dets.tracker_id is not None:
-                for tid, box in zip(p_dets.tracker_id, p_dets.xyxy):
-                    if tid not in team_cache:
-                        team_cache[tid] = assign_team(frame, box)
+                team_assigner.update(frame, p_dets.tracker_id, p_dets.xyxy)
+                for tid in p_dets.tracker_id:
+                    team_cache[int(tid)] = team_assigner.get(int(tid))
 
             # ── Coordenadas de cancha ──
             anchors      = p_dets.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
@@ -399,20 +504,24 @@ def main(
             if sink_ctx:
                 sink_ctx.write_frame(vis)
 
-            cv2.imshow("Basketball Analytics v3", vis)
-            key = cv2.waitKey(1) & 0xFF
-            if   key == ord("q"): break
-            elif key == ord("p"): paused = True
-            elif key == ord("h"): show_hm = not show_hm
-            elif key == ord("m"): show_mm = not show_mm
-            elif key == ord("s"):
-                p = f"screenshot_{frame_idx:04d}.jpg"
-                cv2.imwrite(p, vis)
-                print(f"Screenshot: {p}")
+            if not headless:
+                cv2.imshow("Basketball Analytics v3", vis)
+                key = cv2.waitKey(1) & 0xFF
+                if   key == ord("q"): break
+                elif key == ord("p"): paused = True
+                elif key == ord("h"): show_hm = not show_hm
+                elif key == ord("m"): show_mm = not show_mm
+                elif key == ord("s"):
+                    p = f"screenshot_{frame_idx:04d}.jpg"
+                    cv2.imwrite(p, vis)
+                    print(f"Screenshot: {p}")
+            elif frame_idx % 100 == 0:
+                print(f"  frame {frame_idx:04d}...")
 
     if sink_ctx:
         sink_ctx.__exit__(None, None, None)
-    cv2.destroyAllWindows()
+    if not headless:
+        cv2.destroyAllWindows()
 
     stats.print_summary()
     stats.export_json(f"{stem}_stats.json")
@@ -428,16 +537,29 @@ if __name__ == "__main__":
     ap.add_argument("--weights",  default="yolo11n.pt", help="Pesos YOLO (default: yolo11n.pt)")
     ap.add_argument("--conf",     type=float, default=0.35)
     ap.add_argument("--iou",      type=float, default=0.50)
-    ap.add_argument("--no-heatmap", action="store_true")
-    ap.add_argument("--no-minimap", action="store_true")
+    ap.add_argument("--no-heatmap",  action="store_true")
+    ap.add_argument("--no-minimap",  action="store_true")
+    ap.add_argument("--headless",    action="store_true",
+                    help="Batch mode: skip all cv2 windows, print progress every 100 frames")
+    ap.add_argument("--max-frames",  type=int, default=None,
+                    help="Procesar sólo los primeros N frames (útil para videos largos)")
+    ap.add_argument("--ball-conf",   type=float, default=0.15,
+                    help="Confianza mínima para detectar la pelota (default: 0.15, más bajo = más recall)")
+    ap.add_argument("--court-corners", default=None,
+                    help="Esquinas de la cancha (override manual): 'x1,y1;x2,y2;x3,y3;x4,y4' "
+                         "en orden INF-IZQ;INF-DER;SUP-DER;SUP-IZQ")
     args = ap.parse_args()
 
     main(
-        source       = args.source,
-        output       = args.output,
-        weights      = args.weights,
-        conf         = args.conf,
-        iou          = args.iou,
-        show_heatmap = not args.no_heatmap,
-        show_minimap = not args.no_minimap,
+        source         = args.source,
+        output         = args.output,
+        weights        = args.weights,
+        conf           = args.conf,
+        ball_conf      = args.ball_conf,
+        iou            = args.iou,
+        show_heatmap   = not args.no_heatmap,
+        show_minimap   = not args.no_minimap,
+        headless       = args.headless,
+        max_frames     = args.max_frames,
+        court_corners  = args.court_corners,
     )

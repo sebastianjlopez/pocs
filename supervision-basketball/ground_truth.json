@@ -1,0 +1,185 @@
+[
+  {
+    "video_id": "video_1_9F5q5jCbrMI",
+    "game": "Duke Blue Devils vs Clemson Tigers — 2026 ACC Men's Basketball Tournament Semifinal",
+    "date": "2026-03-13",
+    "team_1_name": "Duke",
+    "team_2_name": "Clemson",
+    "official": {
+      "winner": "team_1",
+      "team_1": {
+        "score": 73,
+        "fgm": 23,
+        "fga": 50,
+        "fg_pct": 46.0,
+        "3pm": 9,
+        "3pa": 24,
+        "3p_pct": 37.5,
+        "ftm": 18,
+        "fta": 22,
+        "ft_pct": 81.8,
+        "rebounds": 41,
+        "assists": 9
+      },
+      "team_2": {
+        "score": 61,
+        "fgm": 18,
+        "fga": 55,
+        "fg_pct": 32.7,
+        "3pm": 7,
+        "3pa": 25,
+        "3p_pct": 28.0,
+        "ftm": 18,
+        "fta": 23,
+        "ft_pct": 78.3,
+        "rebounds": 27,
+        "assists": 10
+      }
+    },
+    "notes": "Video starts at t=5s — likely the full game or a near-complete recording. Duke won convincingly.",
+    "source": "https://goduke.com/news/2026/3/14/mens-basketball-no-1-duke-defeats-clemson-73-61-to-advance-to-acc-title-game"
+  },
+  {
+    "video_id": "video_2_k49qTm4Low",
+    "game": "Louisville Cardinals vs Duke Blue Devils — 2025-26 ACC Men's Basketball Regular Season",
+    "date": "2026-01-26",
+    "team_1_name": "Duke",
+    "team_2_name": "Louisville",
+    "official": {
+      "winner": "team_1",
+      "team_1": {
+        "score": 83,
+        "fgm": 31,
+        "fga": 61,
+        "fg_pct": 50.8,
+        "3pm": 8,
+        "3pa": 23,
+        "3p_pct": 34.8,
+        "ftm": 13,
+        "fta": 18,
+        "ft_pct": 72.2,
+        "rebounds": 47,
+        "assists": null
+      },
+      "team_2": {
+        "score": 52,
+        "fgm": 16,
+        "fga": 54,
+        "fg_pct": 29.6,
+        "3pm": 11,
+        "3pa": 34,
+        "3p_pct": 32.4,
+        "ftm": 9,
+        "fta": 13,
+        "ft_pct": 69.2,
+        "rebounds": 26,
+        "assists": null
+      }
+    },
+    "notes": "Video starts at t=4s — likely near-complete game. Duke blowout win (+31 pts).",
+    "source": "https://goduke.com/news/2026/1/26/mens-basketball-no-4-duke-rolls-past-no-20-louisville-83-52"
+  },
+  {
+    "video_id": "video_3_uJs693eNfuQ",
+    "game": "USA vs France — 2024 Paris Olympics Men's Basketball Gold Medal Game",
+    "date": "2024-08-10",
+    "team_1_name": "USA",
+    "team_2_name": "France",
+    "official": {
+      "winner": "team_1",
+      "team_1": {
+        "score": 98,
+        "fgm": null,
+        "fga": null,
+        "fg_pct": null,
+        "3pm": 8,
+        "3pa": 24,
+        "3p_pct": 33.3,
+        "ftm": null,
+        "fta": null,
+        "ft_pct": null,
+        "rebounds": null,
+        "assists": 10,
+        "top_scorers": [
+          {"name": "Stephen Curry", "pts": 24},
+          {"name": "Kevin Durant",  "pts": 15},
+          {"name": "LeBron James",  "pts": 14, "ast": 10, "reb": 6}
+        ]
+      },
+      "team_2": {
+        "score": 87,
+        "fgm": null,
+        "fga": null,
+        "fg_pct": null,
+        "3pm": null,
+        "3pa": null,
+        "3p_pct": null,
+        "ftm": null,
+        "fta": null,
+        "ft_pct": null,
+        "rebounds": null,
+        "assists": null,
+        "top_scorers": [
+          {"name": "Victor Wembanyama", "pts": 26}
+        ]
+      }
+    },
+    "notes": "Video starts at t=666s (~11 min into upload) — likely a partial game clip (Q3/Q4 or highlight reel). Full-game absolute counts won't match clip stats.",
+    "source": "https://www.espn.com/mens-olympics-basketball/boxscore/_/gameId/401694866"
+  },
+  {
+    "video_id": "video_4_NuXMh3PCyR0",
+    "game": "Gimnasia Comodoro Rivadavia vs Bahía Basket — Liga Nacional Argentina de Baloncesto",
+    "date": "2020-11-11",
+    "team_1_name": "Gimnasia CR",
+    "team_2_name": "Bahía Basket",
+    "official": null,
+    "no_ground_truth": true,
+    "notes": "No official box score available online for this Argentine league game. Pipeline can still run and produce internal stats but no comparison is possible.",
+    "source": "https://www.youtube.com/watch?v=NuXMh3PCyR0"
+  },
+  {
+    "video_id": "video_5_lryAoahRZQk",
+    "game": "PAOK BC vs UCAM Murcia — FIBA Europe Cup 2025-26 Semi-Finals (First Leg)",
+    "date": "2026-04-01",
+    "team_1_name": "PAOK BC",
+    "team_2_name": "UCAM Murcia",
+    "official": {
+      "winner": "team_1",
+      "team_1": {
+        "score": 79,
+        "fgm": null,
+        "fga": null,
+        "fg_pct": 47.0,
+        "fg_2pt_pct": 57.9,
+        "3p_pct": 27.3,
+        "ft_pct": 68.0,
+        "rebounds": null,
+        "assists": null,
+        "top_scorers": [
+          {"name": "Cleveland Melvin", "pts": 23, "reb": 8},
+          {"name": "Breein Tyree",     "pts": 19}
+        ],
+        "quarters": [19, 15, 21, 24]
+      },
+      "team_2": {
+        "score": 73,
+        "fgm": null,
+        "fga": null,
+        "fg_pct": 37.0,
+        "fg_2pt_pct": 43.8,
+        "3p_pct": 23.1,
+        "ft_pct": 65.0,
+        "rebounds": null,
+        "assists": null,
+        "top_scorers": [
+          {"name": "Devontae Cacok",  "pts": 22, "reb": 13},
+          {"name": "Kelan Martin",    "pts": 16}
+        ],
+        "quarters": [17, 26, 12, 18]
+      }
+    },
+    "notes": "Video starts at t=2s — likely full game. PAOK won at home (+6 pts). FGA counts not available, FG% available.",
+    "source": "https://www.fiba.basketball/en/events/fiba-europe-cup-25-26/games/128871-PBC-UCAM"
+  }
+]

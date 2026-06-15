@@ -20,15 +20,46 @@ import cv2
 import numpy as np
 
 
-# Rango HSV del piso de cancha de básquet
-# Madera natural (NBA): tono amarillo-naranja
-# Canchas pintadas: rango más amplio — se ajusta automáticamente
-HSV_RANGES = [
-    # (h_min, h_max, s_min, s_max, v_min, v_max) — rangos a intentar en orden
+# Rangos HSV de respaldo (se intentan si el adaptativo falla)
+HSV_RANGES_FALLBACK = [
+    # (h_min, h_max, s_min, s_max, v_min, v_max)
     (10, 30,  30,  160, 100, 230),   # madera NBA clásica (naranja/tan)
     ( 5, 40,  20,  180,  80, 240),   # rango ampliado
     ( 0, 50,  10,  200,  60, 255),   # muy permisivo
 ]
+
+
+def _adaptive_hsv_range(frame: np.ndarray) -> list[tuple]:
+    """
+    Muestrea el color del piso en la zona central-inferior del frame
+    (donde suele haber cancha y pocos jugadores) y construye un rango HSV
+    adaptativo alrededor de ese color.
+    """
+    h, w = frame.shape[:2]
+    # Zona central-inferior: evita el fondo/tribuna arriba y los extremos
+    roi = frame[int(h * 0.55) : int(h * 0.80), int(w * 0.25) : int(w * 0.75)]
+    if roi.size == 0:
+        return HSV_RANGES_FALLBACK
+
+    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(float)
+
+    # Usar mediana (más robusta a outliers como jugadores o líneas)
+    hm = float(np.median(hsv_roi[:, 0]))
+    sm = float(np.median(hsv_roi[:, 1]))
+    vm = float(np.median(hsv_roi[:, 2]))
+
+    # Rango ±20 en H (circular), ±40 en S y V — amplio para capturar variaciones
+    h_slack, s_slack, v_slack = 20, 40, 50
+    h1 = max(0,   int(hm - h_slack))
+    h2 = min(179, int(hm + h_slack))
+    s1 = max(0,   int(sm - s_slack))
+    s2 = min(255, int(sm + s_slack))
+    v1 = max(40,  int(vm - v_slack))
+    v2 = min(255, int(vm + v_slack))
+
+    adaptive = (h1, h2, s1, s2, v1, v2)
+    # Devolver el rango adaptativo primero, luego los fallbacks
+    return [adaptive] + HSV_RANGES_FALLBACK
 
 
 class CourtDetector:
@@ -80,32 +111,24 @@ class CourtDetector:
         """
         Analiza varios frames del video y elige la mejor detección.
         Si preview=True, muestra la detección antes de continuar.
+        Usa PyAV para decodificar (soporta AV1, H.264, H.265, VP9, etc.)
         """
-        cap = cv2.VideoCapture(video_path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps   = cap.get(cv2.CAP_PROP_FPS)
-        w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        from video_reader import get_video_info, sample_frames as sample_video_frames
 
-        # Muestrear frames del primer 30% del video (evitar replays al final)
-        sample_at = [
-            int(total * (i + 1) / (sample_frames + 1) * 0.3)
-            for i in range(sample_frames)
-        ]
+        info  = get_video_info(video_path)
+        fps   = info.fps
+        w     = info.width
+        h     = info.height
+
+        sampled = sample_video_frames(video_path, n=sample_frames, window=0.3)
 
         candidates: list[tuple[float, np.ndarray, np.ndarray]] = []  # (score, corners, frame)
 
-        for frame_idx in sample_at:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                continue
+        for _frame_idx, frame in sampled:
             corners = self.detect(frame)
             if corners is not None:
                 score = self._score_corners(corners, w, h)
                 candidates.append((score, corners.copy(), frame.copy()))
-
-        cap.release()
 
         if not candidates:
             print("No se detectó la cancha. Usando bordes del frame como fallback.")
@@ -126,8 +149,10 @@ class CourtDetector:
         self, frame: np.ndarray, min_area: float
     ) -> np.ndarray | None:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Usar rango adaptativo basado en el color real del piso
+        ranges = _adaptive_hsv_range(frame)
 
-        for (h1, h2, s1, s2, v1, v2) in HSV_RANGES:
+        for (h1, h2, s1, s2, v1, v2) in ranges:
             mask = cv2.inRange(hsv, (h1, s1, v1), (h2, s2, v2))
 
             # Limpiar ruido

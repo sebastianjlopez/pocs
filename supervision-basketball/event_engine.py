@@ -31,7 +31,7 @@ PASS_MIN_SPEED_MS        = 6.0    # pase: la pelota va a > 6 m/s
 PASS_MAX_DIST_PLAYER_M   = 2.5    # al recibir, el jugador está a < 2.5m
 SHOT_RIM_APPROACH_M      = 4.0    # umbral: la pelota está a menos de 4m del aro
 SHOT_MIN_SPEED_MS        = 4.0    # el tiro va a > 4 m/s
-BASKET_RIM_MAX_M         = 0.8    # canasta: pelota pasó a menos de 80cm del aro
+BASKET_RIM_MAX_M         = 1.5    # canasta: pelota pasó a menos de 150cm del aro (margen por inaccuracidad de perspectiva)
 DEAD_BALL_MAX_SPEED_MS   = 0.5    # pelota casi quieta
 DEAD_BALL_MIN_FRAMES     = 15     # frames quieta para declarar pelota muerta
 
