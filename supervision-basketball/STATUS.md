@@ -120,8 +120,9 @@ a veces motion-blurred.
 
 **En curso → fine-tuning en GPU de Colab.** Ver [`COLAB_TRAINING.md`](./COLAB_TRAINING.md)
 y el notebook [`train_basketball_yolo.ipynb`](./train_basketball_yolo.ipynb): entrena
-`yolo11x` en un dataset de básquet de Roboflow (jugadores + pelota + aro) en GPU de
-Colab. `basketball_poc_v3.py` ahora acepta `--player-class` y `--ball-class` para usar
+`yolo11x` en GPU de Colab sobre el dataset recomendado
+[`roboflow-jvuqo/basketball-player-detection-3-ycjdo`](https://universe.roboflow.com/roboflow-jvuqo/basketball-player-detection-3-ycjdo)
+(clases ball/player/referee/rim/ball-in-basket). `basketball_poc_v3.py` ahora acepta `--player-class` y `--ball-class` para usar
 el esquema de clases del modelo fine-tuneado (los defaults siguen siendo COCO 0/32).
 
 El MCP `colab-mcp` se evaluó para manejar Colab desde el agente, pero **requiere correr

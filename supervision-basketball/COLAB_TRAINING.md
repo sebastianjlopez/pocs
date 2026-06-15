@@ -14,6 +14,45 @@ es pesado para entrenar en CPU, lo entrenamos en GPU de Colab.
 
 ---
 
+## Qué dataset usar
+
+**Recomendado:** [`roboflow-jvuqo/basketball-player-detection-3-ycjdo`](https://universe.roboflow.com/roboflow-jvuqo/basketball-player-detection-3-ycjdo)
+(Roboflow Universe). Es el dataset que usa el **pipeline oficial de básquet de
+Roboflow** ([blog](https://blog.roboflow.com/identify-basketball-players/) /
+[notebook](https://github.com/roboflow/notebooks/blob/main/notebooks/basketball-ai-how-to-detect-track-and-identify-basketball-players.ipynb)),
+así que está bien mantenido y cubre lo que necesitamos.
+
+Clases (versión 6) — el `ball-in-basket` y `rim` son clave para detectar canastas:
+
+| Índice | Clase | Uso en el POC |
+|---|---|---|
+| 0 | `ball` | → `--ball-class 0` |
+| 1 | `player` | → `--player-class 1` |
+| 2 | `number` | (dorsal, no se usa aún) |
+| 3 | `referee` | se ignora |
+| 4 | `ball-in-basket` | señal directa de canasta |
+| 5 | `player-in-possession` | posesión |
+| 6 | `player-jump-shot` | tiro |
+| 7 | `player-layup-dunk` | tiro/bandeja |
+| 8 | `player-shot-block` | tapón |
+| 9 | `rim` | aro (referencia de canasta) |
+
+> ⚠️ El orden de clases puede cambiar entre versiones del dataset. **Confirmá
+> siempre los índices con la celda 4 del notebook** (imprime el `data.yaml`) antes
+> de pasar `--player-class` / `--ball-class`. Con la versión 6 los valores son
+> `--ball-class 0 --player-class 1`.
+
+**Alternativas en [Roboflow Universe](https://universe.roboflow.com/search?q=class%3Abasketball):**
+- [`basketballcomputervision/basketball-computer-vision`](https://universe.roboflow.com/basketballcomputervision/basketball-computer-vision)
+  — YOLOv11, mAP@50 ≈ 92%, clases ball/player/referee/rim.
+- [`roboflow-universe-projects/basketball-players-fy4c2`](https://universe.roboflow.com/roboflow-universe-projects/basketball-players-fy4c2)
+  — más liviano (jugadores + pelota), bueno para una corrida rápida de prueba.
+
+Si tu prioridad es **detectar canastas**, elegí siempre uno que tenga `rim` y/o
+`ball-in-basket` entre sus clases.
+
+---
+
 ## Opción A — Entrenar a mano (no requiere MCP)
 
 1. Subí `train_basketball_yolo.ipynb` a [Google Colab](https://colab.research.google.com).
