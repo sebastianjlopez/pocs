@@ -19,6 +19,57 @@ RIM_RIGHT = np.array([2713.0, 762.0])   # aro derecho
 RIM_RADIUS_CM = 45.7 / 2               # radio del aro
 
 
+class _KalmanCV2D:
+    """
+    Filtro de Kalman de velocidad constante en 2D.
+
+    Estado = [x, y, vx, vy]. Sirve para predecir la posición de la pelota
+    cuando YOLO la pierde (p.ej. durante el arco del tiro), siguiendo su
+    trayectoria en vez de congelar la última posición conocida.
+    """
+
+    def __init__(self, process_var: float = 4.0, measure_var: float = 10.0) -> None:
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=float)
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=float)
+        self.Q = np.eye(4) * process_var
+        self.R = np.eye(2) * measure_var
+        self.x: np.ndarray | None = None
+        self.P = np.eye(4) * 1000.0
+
+    def reset(self, z: np.ndarray) -> np.ndarray:
+        self.x = np.array([z[0], z[1], 0.0, 0.0], dtype=float)
+        self.P = np.eye(4) * 1000.0
+        return self.x[:2].copy()
+
+    def predict(self) -> np.ndarray | None:
+        """Avanza el estado un frame y devuelve la posición predicha."""
+        if self.x is None:
+            return None
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.x[:2].copy()
+
+    def correct(self, z: np.ndarray) -> np.ndarray:
+        """Corrige el estado con una medición real (posición observada)."""
+        z = np.asarray(z, dtype=float)
+        if self.x is None:
+            return self.reset(z)
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        return self.x[:2].copy()
+
+    @property
+    def position(self) -> np.ndarray | None:
+        return None if self.x is None else self.x[:2].copy()
+
+
 @dataclass
 class BallSample:
     """Una observación de la pelota en un frame."""
@@ -58,6 +109,9 @@ class BallTracker:
         self.pixel_history: deque[np.ndarray] = deque(maxlen=int(fps * 0.5))  # para detectar rebotes
         self._missing_frames = 0
         self.MAX_MISSING = int(fps * 0.5)   # si no aparece 0.5s → se pierde
+        # Kalman: uno en píxeles (display/trace) y otro en cancha (cm, eventos)
+        self._kf_pixel = _KalmanCV2D(process_var=4.0,  measure_var=10.0)
+        self._kf_court = _KalmanCV2D(process_var=25.0, measure_var=100.0)
 
     # ------------------------------------------------------------------
     def update(
@@ -70,19 +124,25 @@ class BallTracker:
         """Registrar la posición de la pelota en este frame."""
         if pixel_xy is None or court_xy is None:
             self._missing_frames += 1
-            if self._missing_frames <= self.MAX_MISSING and len(self.history) > 0:
-                # Interpolar: mantener última posición conocida con menor confianza
-                last = self.history[-1]
+            # Predecir con Kalman mientras el gap sea corto: sigue la trayectoria
+            # (parabólica aprox.) en vez de congelar la última posición.
+            if self._missing_frames <= self.MAX_MISSING and self._kf_court.position is not None:
+                pred_court = self._kf_court.predict()
+                pred_pixel = self._kf_pixel.predict()
+                conf = max(0.05, 0.6 * (1.0 - self._missing_frames / max(1, self.MAX_MISSING)))
                 self.history.append(BallSample(
                     frame_idx=frame_idx,
-                    pixel_xy=last.pixel_xy.copy(),
-                    court_xy=last.court_xy.copy(),
-                    confidence=0.1,
+                    pixel_xy=pred_pixel,
+                    court_xy=pred_court,
+                    confidence=conf,
                     detected=False,
                 ))
             return
 
         self._missing_frames = 0
+        # Un predict + correct por frame mantiene el filtro sincronizado
+        self._kf_pixel.predict(); self._kf_pixel.correct(pixel_xy)
+        self._kf_court.predict(); self._kf_court.correct(court_xy)
         self.history.append(BallSample(
             frame_idx=frame_idx,
             pixel_xy=pixel_xy.copy(),

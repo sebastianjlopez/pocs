@@ -129,8 +129,14 @@ El MCP `colab-mcp` se evaluó para manejar Colab desde el agente, pero **requier
 Claude Code localmente** (necesita el navegador del usuario), así que no funciona desde
 la sesión web remota. La config quedó versionada en `.mcp.json` para uso local.
 
+**Hecho → Kalman filter para la pelota** (`ball_tracker.py`). Filtro de velocidad
+constante en 2D (estado `[x,y,vx,vy]`, solo numpy) que predice la posición de la
+pelota durante los gaps de detección siguiendo su trayectoria, en vez de congelar
+la última posición. Corre en dos espacios (píxeles para display, cancha para
+eventos). La velocidad se sigue calculando solo con detecciones reales, así que
+las predicciones no inflan los SHOT events.
+
 Otras opciones complementarias:
-- Kalman filter dedicado para predecir trayectoria de la pelota entre detecciones
 - Entrenar con `imgsz=1280` (A100) para mejor recall del objeto chico
 
 ### Problema secundario: TeamAssigner no converge en clips cortos
