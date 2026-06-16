@@ -2,27 +2,22 @@
 # run_all_benchmarks.sh
 # Corre el pipeline en los 5 videos en modo headless y luego ejecuta el benchmark.
 #
-# Uso:
-#   bash run_all_benchmarks.sh
-#   bash run_all_benchmarks.sh --weights yolo11x.pt   (modelo más preciso, más lento)
+# Uso (desde la raíz del repo):
+#   bash scripts/run_all_benchmarks.sh
+#   bash scripts/run_all_benchmarks.sh models/yolo11x.pt
+#
+# Override de directorio de videos:
+#   VIDEOS_DIR=/ruta/a/videos bash scripts/run_all_benchmarks.sh
 #
 # Requisitos:
 #   pip install ultralytics supervision opencv-python
-#   Los archivos de video deben estar en el mismo directorio.
 
 set -euo pipefail
 
-WEIGHTS="${1:---weights}"
-WEIGHTS_VAL="${2:-yolo11n.pt}"
-
-# Si no se pasó --weights, usar el default
-if [[ "$WEIGHTS" != "--weights" ]]; then
-    WEIGHTS_VAL="$WEIGHTS"
-    WEIGHTS="--weights"
-fi
-
-GROUND_TRUTH="ground_truth.json"
-REPORT_JSON="benchmark_report.json"
+WEIGHTS="${1:-models/yolo11n.pt}"
+GROUND_TRUTH="data/ground_truth.json"
+REPORT_JSON="outputs/benchmark_report.json"
+VIDEOS_DIR="${VIDEOS_DIR:-videos}"
 
 VIDEOS=(
     "video_1_9F5q5jCbrMI.mp4"
@@ -32,24 +27,31 @@ VIDEOS=(
     "video_5_lryAoahRZQk.mp4"
 )
 
+mkdir -p outputs
+
 echo "========================================================================"
-echo "  Basketball Analytics POC — Benchmark Runner"
-echo "  Modelo: $WEIGHTS_VAL"
+echo "  Basketball Analytics — Benchmark Runner"
+echo "  Modelo: $WEIGHTS"
 echo "========================================================================"
 echo ""
 
 # ── Paso 1: correr el pipeline en cada video ──────────────────────────────────
 for VIDEO in "${VIDEOS[@]}"; do
-    if [[ ! -f "$VIDEO" ]]; then
+    # Buscar video en VIDEOS_DIR o en raíz
+    if [[ -f "$VIDEOS_DIR/$VIDEO" ]]; then
+        SRC="$VIDEOS_DIR/$VIDEO"
+    elif [[ -f "$VIDEO" ]]; then
+        SRC="$VIDEO"
+    else
         echo "⚠  $VIDEO no encontrado — saltando."
         continue
     fi
 
     STEM="${VIDEO%.mp4}"
-    STATS_FILE="${STEM}_stats.json"
+    STATS_FILE="outputs/${STEM}_stats.json"
 
     if [[ -f "$STATS_FILE" ]]; then
-        echo "✓  $STATS_FILE ya existe — reutilizando (borrá el archivo para re-procesar)."
+        echo "✓  $STATS_FILE ya existe — reutilizando (borrá para re-procesar)."
         continue
     fi
 
@@ -57,15 +59,19 @@ for VIDEO in "${VIDEOS[@]}"; do
     echo "  Procesando: $VIDEO"
     echo "────────────────────────────────────────────────────────────────────"
 
-    python basketball_poc_v3.py \
-        --source "$VIDEO" \
-        "$WEIGHTS" "$WEIGHTS_VAL" \
+    python scripts/run_pipeline.py \
+        --source "$SRC" \
+        --weights "$WEIGHTS" \
         --no-heatmap \
         --no-minimap \
         --headless
 
+    # El pipeline guarda stats en la raíz; moverlos a outputs/
+    [[ -f "${STEM}_stats.json"    ]] && mv "${STEM}_stats.json"    "$STATS_FILE"
+    [[ -f "${STEM}_tracking.csv"  ]] && mv "${STEM}_tracking.csv"  "outputs/${STEM}_tracking.csv"
+
     if [[ -f "$STATS_FILE" ]]; then
-        echo "  ✓ Stats exportados: $STATS_FILE"
+        echo "  ✓ Stats: $STATS_FILE"
     else
         echo "  ✗ No se generó $STATS_FILE — revisar errores arriba."
     fi
@@ -78,11 +84,11 @@ echo "  Ejecutando benchmark.py ..."
 echo "========================================================================"
 echo ""
 
-python benchmark.py \
+python scripts/benchmark.py \
     --all \
     --ground-truth "$GROUND_TRUTH" \
     --output "$REPORT_JSON"
 
 echo ""
-echo "Reporte JSON guardado en: $REPORT_JSON"
+echo "Reporte JSON: $REPORT_JSON"
 echo "Done."
