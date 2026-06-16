@@ -30,7 +30,9 @@ DRIBBLE_MAX_SPEED_MS     = 3.5    # picando: la pelota no viaja lejos (< 3.5 m/s
 PASS_MIN_SPEED_MS        = 6.0    # pase: la pelota va a > 6 m/s
 PASS_MAX_DIST_PLAYER_M   = 2.5    # al recibir, el jugador está a < 2.5m
 SHOT_MIN_SPEED_MS        = 4.0    # el tiro va a > 4 m/s
+SHOT_MAX_SPEED_MS        = 15.0   # velocidad máxima realista de un tiro de básquet (~15 m/s)
 SHOT_MIN_COS_ANGLE       = 0.25   # cos del ángulo máx. hacia el aro (~75°)
+SHOT_COOLDOWN_FRAMES     = 90     # bloquear nuevos tiros 3 s después de uno (a 30 fps)
 PASS_LOOKBACK_FRAMES_S   = 2.0    # segundos hacia atrás para detectar pase demorado
 BASKET_RIM_MAX_M         = 1.5    # canasta: pelota pasó a menos de 150cm del aro (margen por inaccuracidad de perspectiva)
 DEAD_BALL_MAX_SPEED_MS   = 0.5    # pelota casi quieta
@@ -121,6 +123,9 @@ class EventEngine:
         # Frames consecutivos con pelota lenta (para hysteresis de DEAD_BALL)
         self._slow_frames: int = 0
 
+        # Cooldown entre tiros (evita ráfagas de falsos positivos)
+        self._shot_cooldown: int = 0   # frames restantes de espera
+
         # Para detectar si el tiro fue canasta
         self._shot_active  = False
         self._shot_rim:    np.ndarray | None = None  # aro al que apunta
@@ -143,6 +148,9 @@ class EventEngine:
         Procesar el estado de la pelota en este frame.
         Devuelve lista de eventos ocurridos (puede ser vacía).
         """
+        if self._shot_cooldown > 0:
+            self._shot_cooldown -= 1
+
         if not state.detected:
             self.phase_frames += 1
             return []
@@ -304,11 +312,13 @@ class EventEngine:
 
         # IN_FLIGHT: la pelota salió volando
         elif new_phase == BallPhase.IN_FLIGHT:
-            # Tiro: velocidad suficiente + dirección apunta al aro
+            # Tiro: velocidad en rango realista + dirección apunta al aro
+            # SHOT_MAX_SPEED_MS filtra velocidades espurias del Kalman (pelota perdida → reaparece lejos)
             is_shot = (
-                state.speed_ms >= SHOT_MIN_SPEED_MS
+                SHOT_MIN_SPEED_MS <= state.speed_ms <= SHOT_MAX_SPEED_MS
                 and self._is_moving_toward_rim(state, near_rim)
                 and effective_possessor is not None   # sabemos quién tiró
+                and self._shot_cooldown == 0           # sin ráfagas de tiros
             )
 
             if is_shot:
@@ -328,6 +338,7 @@ class EventEngine:
                 self._shot_team     = effective_team
                 self._shot_frame    = frame_idx
                 self._min_rim_dist  = float("inf")
+                self._shot_cooldown = SHOT_COOLDOWN_FRAMES
 
         # LOOSE: pelota suelta
         elif new_phase == BallPhase.LOOSE:
