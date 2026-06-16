@@ -1,1 +1,46 @@
+# --- Entorno virtual ---
 supervision/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Videos (demasiado grandes para git) ---
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# --- Pesos de modelos YOLO (>5 MB) ---
+models/*.pt
+models/*.pth
+models/*.weights
+# Excepción: permitir el .gitkeep
+!models/.gitkeep
+
+# --- Outputs generados ---
+outputs/*.json
+outputs/*.csv
+outputs/*.mp4
+outputs/*.avi
+outputs/*.txt
+# Excepción: permitir el .gitkeep
+!outputs/.gitkeep
+
+# --- Archivos de debug ---
+*.jpg
+*.png
+debug_*
+test_frame*
+
+# --- Stats / tracking en raíz (legacy) ---
+*_stats.json
+*_tracking.csv
+benchmark_report.json
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

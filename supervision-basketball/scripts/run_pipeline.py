@@ -1,10 +1,10 @@
 """
-Basketball Analytics POC v3
-----------------------------
+Basketball Analytics — Pipeline principal
+------------------------------------------
 Uso:
-    python basketball_poc_v3.py --source video.mp4
-    python basketball_poc_v3.py --source video.mp4 --output resultado.mp4
-    python basketball_poc_v3.py --source video.mp4 --weights yolo11x.pt
+    python scripts/run_pipeline.py --source video.mp4
+    python scripts/run_pipeline.py --source video.mp4 --output resultado.mp4
+    python scripts/run_pipeline.py --source video.mp4 --weights models/yolo11x.pt
 
 La cancha se detecta automáticamente en los primeros frames.
 Se muestra una preview 3 segundos — presioná ENTER para continuar.
@@ -22,6 +22,28 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict, deque
 from pathlib import Path
+import sys
+import warnings
+
+# Agregar src/ al path. Probamos 3 estrategias en orden:
+#   1. Relativo al script (funciona cuando __file__ es absoluto)
+#   2. Relativo al cwd (funciona cuando se corre desde la raíz del repo)
+#   3. Variable de entorno PYTHONPATH ya seteada externamente
+def _find_src() -> Path:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "src",  # <repo>/src
+        Path.cwd() / "src",                               # cwd/src
+    ]
+    for c in candidates:
+        if (c / "ball_tracker.py").exists():
+            return c
+    raise ImportError(
+        "No se encontró src/ball_tracker.py.\n"
+        f"  Probado: {[str(c) for c in candidates]}\n"
+        "  Verificá que el repo esté completo: cd /content/pocs && git pull"
+    )
+
+sys.path.insert(0, str(_find_src()))
 
 import cv2
 import numpy as np
@@ -318,6 +340,8 @@ def main(
     print(f"Video: {video_info.width}×{video_info.height} @ {fps:.1f} fps\n")
 
     # Fix 5: track_buffer más largo + mínimo 3 frames consecutivos para confirmar track
+    # ByteTrack is deprecated since supervision v0.28; suppress until we migrate to InertiaTracker
+    warnings.filterwarnings('ignore', message='.*ByteTrack.*deprecated.*', category=FutureWarning)
     byte_track = sv.ByteTrack(
         frame_rate=fps,
         track_activation_threshold=conf,
@@ -430,6 +454,10 @@ def main(
             stats.tick(frame_idx)
 
             # ── Exportar CSV ──
+            # supervision ≥0.28 adds 'class_name' to Detections.data via from_ultralytics();
+            # strip it so CSVSink header (written on frame 0, when there are no detections)
+            # matches subsequent frames that do have detections.
+            p_dets.data.pop('class_name', None)
             csv_sink.append(p_dets, custom_data={"frame": frame_idx})
 
             # ── Render ──
