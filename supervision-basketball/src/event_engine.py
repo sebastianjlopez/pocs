@@ -29,11 +29,12 @@ POSSESSION_MIN_FRAMES    = 8      # mínimo de frames seguidos para confirmar po
 DRIBBLE_MAX_SPEED_MS     = 3.5    # picando: la pelota no viaja lejos (< 3.5 m/s)
 PASS_MIN_SPEED_MS        = 6.0    # pase: la pelota va a > 6 m/s
 PASS_MAX_DIST_PLAYER_M   = 2.5    # al recibir, el jugador está a < 2.5m
-SHOT_RIM_APPROACH_M      = 4.0    # umbral: la pelota está a menos de 4m del aro
 SHOT_MIN_SPEED_MS        = 4.0    # el tiro va a > 4 m/s
+SHOT_MIN_COS_ANGLE       = 0.25   # cos del ángulo máx. hacia el aro (~75°)
+PASS_LOOKBACK_FRAMES_S   = 2.0    # segundos hacia atrás para detectar pase demorado
 BASKET_RIM_MAX_M         = 1.5    # canasta: pelota pasó a menos de 150cm del aro (margen por inaccuracidad de perspectiva)
 DEAD_BALL_MAX_SPEED_MS   = 0.5    # pelota casi quieta
-DEAD_BALL_MIN_FRAMES     = 15     # frames quieta para declarar pelota muerta
+DEAD_BALL_MIN_FRAMES     = 15     # frames CONSECUTIVOS quieta para declarar pelota muerta
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,14 @@ class EventEngine:
         self.possessor_team: int | None = None
         self.possession_frame: int = 0
 
+        # Último poseedor conocido (persiste a través de DEAD_BALL para atribuir tiros/pases)
+        self._last_possessor_id:    int | None = None
+        self._last_possessor_team:  int | None = None
+        self._last_possession_frame: int = 0
+
+        # Frames consecutivos con pelota lenta (para hysteresis de DEAD_BALL)
+        self._slow_frames: int = 0
+
         # Para detectar si el tiro fue canasta
         self._shot_active  = False
         self._shot_rim:    np.ndarray | None = None  # aro al que apunta
@@ -178,9 +187,16 @@ class EventEngine:
     # ------------------------------------------------------------------
     def _classify_phase(self, state: BallState, rim_dist: float) -> BallPhase:
         """Determinar en qué fase está la pelota ahora."""
-        # Pelota muerta (casi quieta)
+        # Pelota muerta (casi quieta) — requiere N frames CONSECUTIVOS para evitar
+        # falsos positivos por frames donde YOLO pierde momentáneamente la pelota.
         if state.speed_ms < DEAD_BALL_MAX_SPEED_MS:
-            return BallPhase.DEAD
+            self._slow_frames += 1
+            if self.phase == BallPhase.DEAD or self._slow_frames >= DEAD_BALL_MIN_FRAMES:
+                return BallPhase.DEAD
+            # Pendiente de confirmación: mantener fase actual hasta acumular frames
+            return self.phase
+        else:
+            self._slow_frames = 0
 
         # Cerca de un jugador y lenta → posesión
         if (
@@ -209,9 +225,28 @@ class EventEngine:
         pid  = state.nearest_player_id
         team = team_cache.get(pid, None) if pid is not None else None
 
+        _lookback = int(self.fps * PASS_LOOKBACK_FRAMES_S)
+
+        # Para PASES: ventana corta (PASS_LOOKBACK_FRAMES_S) — el receptor debe aparecer pronto.
+        # Para TIROS: usamos el último poseedor absoluto, sin límite de tiempo.
+        # En básquet, si la pelota sale volando hacia el aro, siempre fue alguien quien la tiró.
+        effective_possessor = self.possessor_id
+        effective_team      = self.possessor_team
+        if effective_possessor is None and self._last_possessor_id is not None:
+            effective_possessor = self._last_possessor_id   # sin límite de tiempo para tiros
+            effective_team      = self._last_possessor_team
+
+        # Para pases: restringir a ventana corta
+        pass_possessor = self.possessor_id
+        pass_team      = self.possessor_team
+        if pass_possessor is None and self._last_possessor_id is not None:
+            if frame_idx - self._last_possession_frame <= _lookback:
+                pass_possessor = self._last_possessor_id
+                pass_team      = self._last_possessor_team
+
         # POSSESSED: alguien agarró la pelota
         if new_phase == BallPhase.POSSESSED:
-            # Cambio de poseedor = pase recibido
+            # Pase directo: IN_FLIGHT → POSSESSED con diferente jugador
             if (
                 self.phase == BallPhase.IN_FLIGHT
                 and self.possessor_id is not None
@@ -223,6 +258,25 @@ class EventEngine:
                     player_id=self.possessor_id,
                     receiver_id=pid,
                     team=self.possessor_team,
+                    ball_pos=state.court_xy.copy(),
+                    speed_ms=state.speed_ms,
+                ))
+                emitted.append(ev)
+
+            # Pase demorado: pasó por DEAD/LOOSE pero hubo un poseedor reciente
+            # del mismo equipo → contar como pase en vez de nueva posesión aislada.
+            elif (
+                self.phase in (BallPhase.LOOSE, BallPhase.DEAD)
+                and pass_possessor is not None
+                and pid != pass_possessor
+                and team_cache.get(pid) == pass_team
+            ):
+                ev = self._emit(GameEvent(
+                    type=EventType.PASS,
+                    frame_idx=frame_idx,
+                    player_id=pass_possessor,
+                    receiver_id=pid,
+                    team=pass_team,
                     ball_pos=state.court_xy.copy(),
                     speed_ms=state.speed_ms,
                 ))
@@ -240,23 +294,29 @@ class EventEngine:
                     metadata={"bouncing": state.is_bouncing},
                 ))
                 emitted.append(ev)
-                self.possessor_id   = pid
-                self.possessor_team = team
+                # Actualizar último poseedor ANTES de pisarlo
+                self._last_possessor_id     = pid
+                self._last_possessor_team   = team
+                self._last_possession_frame = frame_idx
+                self.possessor_id    = pid
+                self.possessor_team  = team
                 self.possession_frame = frame_idx
 
         # IN_FLIGHT: la pelota salió volando
         elif new_phase == BallPhase.IN_FLIGHT:
-            is_toward_rim = (
-                state.dist_to_rim_left_m  < SHOT_RIM_APPROACH_M
-                or state.dist_to_rim_right_m < SHOT_RIM_APPROACH_M
-            ) and state.speed_ms >= SHOT_MIN_SPEED_MS
+            # Tiro: velocidad suficiente + dirección apunta al aro
+            is_shot = (
+                state.speed_ms >= SHOT_MIN_SPEED_MS
+                and self._is_moving_toward_rim(state, near_rim)
+                and effective_possessor is not None   # sabemos quién tiró
+            )
 
-            if is_toward_rim:
+            if is_shot:
                 ev = self._emit(GameEvent(
                     type=EventType.SHOT,
                     frame_idx=frame_idx,
-                    player_id=self.possessor_id,
-                    team=self.possessor_team,
+                    player_id=effective_possessor,
+                    team=effective_team,
                     ball_pos=state.court_xy.copy(),
                     speed_ms=state.speed_ms,
                     metadata={"rim": near_rim.tolist()},
@@ -264,13 +324,10 @@ class EventEngine:
                 emitted.append(ev)
                 self._shot_active   = True
                 self._shot_rim      = near_rim
-                self._shot_player   = self.possessor_id
-                self._shot_team     = self.possessor_team
+                self._shot_player   = effective_possessor
+                self._shot_team     = effective_team
                 self._shot_frame    = frame_idx
                 self._min_rim_dist  = float("inf")
-            else:
-                # Pase iniciado (se confirmará cuando alguien lo reciba)
-                pass
 
         # LOOSE: pelota suelta
         elif new_phase == BallPhase.LOOSE:
@@ -291,9 +348,27 @@ class EventEngine:
                     ball_pos=state.court_xy.copy(),
                 ))
                 emitted.append(ev)
+                # _last_possessor_id se mantiene para atribuir el próximo tiro/pase
                 self.possessor_id = None
 
         return emitted
+
+    # ------------------------------------------------------------------
+    def _is_moving_toward_rim(self, state: BallState, near_rim: np.ndarray) -> bool:
+        """
+        Devuelve True si el vector de velocidad de la pelota apunta
+        aproximadamente hacia el aro (cos del ángulo > SHOT_MIN_COS_ANGLE).
+        """
+        vel = state.velocity_court          # cm/frame
+        vel_norm = float(np.linalg.norm(vel))
+        if vel_norm < 1.0:
+            return False
+        to_rim = near_rim - state.court_xy
+        rim_norm = float(np.linalg.norm(to_rim))
+        if rim_norm < 1.0:
+            return True   # ya está en el aro
+        cos_angle = float(np.dot(vel / vel_norm, to_rim / rim_norm))
+        return cos_angle > SHOT_MIN_COS_ANGLE
 
     # ------------------------------------------------------------------
     def _nearest_rim(self, state: BallState) -> tuple[np.ndarray, float]:
